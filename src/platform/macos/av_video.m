@@ -8,6 +8,7 @@
 // local includes
 #import "av_video.h"
 
+/// @cond DOXYGEN_SKIP
 @interface AVVideo ()
 @property (nonatomic, strong) SCStream *stream;  ///< Active SCK stream.
 @property (nonatomic, copy) FrameCallbackBlock frameCallback;  ///< Per-frame callback.
@@ -15,6 +16,7 @@
 @property (nonatomic, strong) dispatch_queue_t sampleQueue;  ///< Serial delivery queue.
 @property (nonatomic, assign) BOOL stopped;  ///< Guards single-shot teardown.
 @end
+/// @endcond
 
 @implementation AVVideo
 
@@ -166,19 +168,13 @@
   if (type != SCStreamOutputTypeScreen) {
     return;
   }
+  // Require a valid image buffer — that alone rejects empty status-only
+  // callbacks. Do NOT gate on SCFrameStatus: on some macOS builds the status
+  // attachment is missing or has an unexpected value, which would drop every
+  // real frame and leave the encoder duplicating one stale frame (a frozen
+  // image at full frame rate).
   if (!CMSampleBufferIsValid(sampleBuffer) || CMSampleBufferGetImageBuffer(sampleBuffer) == NULL) {
     return;
-  }
-
-  // SCK sends status frames (idle/blank/started/suspended) with no useful
-  // pixels. Only forward frames flagged complete.
-  NSArray *attachments = (__bridge NSArray *) CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, NO);
-  if (attachments.count > 0) {
-    NSDictionary *info = attachments[0];
-    NSNumber *status = info[SCStreamFrameInfoStatus];
-    if (status != nil && status.intValue != SCFrameStatusComplete) {
-      return;
-    }
   }
 
   FrameCallbackBlock callback = nil;
