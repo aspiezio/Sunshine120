@@ -1,18 +1,33 @@
 /**
  * @file src/platform/macos/av_video.m
- * @brief Definitions for video capture on macOS.
+ * @brief Definitions for video capture on macOS (ScreenCaptureKit backend).
+ *
+ * NOTE: This file must be compiled with ARC (-fobjc-arc). See the CMake change
+ * in cmake/compile_definitions/macos.cmake.
  */
 // local includes
 #import "av_video.h"
+
+@interface AVVideo ()
+@property (nonatomic, strong) SCStream *stream;  ///< Active SCK stream.
+@property (nonatomic, copy) FrameCallbackBlock frameCallback;  ///< Per-frame callback.
+@property (nonatomic, strong) dispatch_semaphore_t captureStopSignal;  ///< Signaled on stop.
+@property (nonatomic, strong) dispatch_queue_t sampleQueue;  ///< Serial delivery queue.
+@property (nonatomic, assign) BOOL stopped;  ///< Guards single-shot teardown.
+@end
 
 @implementation AVVideo
 
 - (id)initWithDisplay:(CGDirectDisplayID)displayID frameRate:(int)frameRate {
   self = [super init];
+  if (!self) {
+    return nil;
+  }
 
+  // Query native pixel dimensions up front; display.mm reads frameWidth/
+  // frameHeight immediately after init to size the stream.
   CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displayID);
   if (!mode) {
-    [self release];
     return nil;
   }
 
@@ -21,34 +36,11 @@
   self.frameWidth = (int) CGDisplayModeGetPixelWidth(mode);
   self.frameHeight = (int) CGDisplayModeGetPixelHeight(mode);
   self.minFrameDuration = CMTimeMake(1, frameRate);
-  self.session = [[AVCaptureSession alloc] init];
-  self.videoOutputs = [[NSMapTable alloc] init];
-  self.captureCallbacks = [[NSMapTable alloc] init];
-  self.captureSignals = [[NSMapTable alloc] init];
+  self.stopped = NO;
 
   CFRelease(mode);
 
-  AVCaptureScreenInput *screenInput = [[AVCaptureScreenInput alloc] initWithDisplayID:self.displayID];
-  [screenInput setMinFrameDuration:self.minFrameDuration];
-
-  if ([self.session canAddInput:screenInput]) {
-    [self.session addInput:screenInput];
-  } else {
-    [screenInput release];
-    return nil;
-  }
-
-  [self.session startRunning];
-
   return self;
-}
-
-- (void)dealloc {
-  [self.videoOutputs release];
-  [self.captureCallbacks release];
-  [self.captureSignals release];
-  [self.session stopRunning];
-  [super dealloc];
 }
 
 - (void)setFrameWidth:(int)frameWidth frameHeight:(int)frameHeight {
@@ -56,61 +48,164 @@
   self.frameHeight = frameHeight;
 }
 
+/**
+ * @brief Resolve the SCDisplay matching self.displayID (synchronous).
+ *
+ * SCShareableContent enumeration is async; block until it returns to preserve
+ * the synchronous init/capture flow the C++ side expects.
+ */
+- (SCDisplay *)resolveDisplay {
+  __block SCDisplay *found = nil;
+  dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+  [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *error) {
+    if (!error && content) {
+      for (SCDisplay *candidate in content.displays) {
+        if (candidate.displayID == self.displayID) {
+          found = candidate;
+          break;
+        }
+      }
+      // Fall back to the first available display, mirroring the AVFoundation
+      // backend's "default to main display" behavior.
+      if (found == nil) {
+        found = content.displays.firstObject;
+      }
+    }
+    dispatch_semaphore_signal(sem);
+  }];
+
+  dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+  return found;
+}
+
 - (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback {
   @synchronized(self) {
-    AVCaptureVideoDataOutput *videoOutput = [[AVCaptureVideoDataOutput alloc] init];
+    self.frameCallback = frameCallback;
+    self.stopped = NO;
+    self.captureStopSignal = dispatch_semaphore_create(0);
 
-    [videoOutput setVideoSettings:@{
-      (NSString *) kCVPixelBufferPixelFormatTypeKey: [NSNumber numberWithUnsignedInt:self.pixelFormat],
-      (NSString *) kCVPixelBufferWidthKey: [NSNumber numberWithInt:self.frameWidth],
-      (NSString *) kCVPixelBufferHeightKey: [NSNumber numberWithInt:self.frameHeight],
-      (NSString *) AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,
-    }];
-
-    dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, DISPATCH_QUEUE_PRIORITY_HIGH);
-    dispatch_queue_t recordingQueue = dispatch_queue_create("videoCaptureQueue", qos);
-    [videoOutput setSampleBufferDelegate:self queue:recordingQueue];
-
-    [self.session stopRunning];
-
-    if ([self.session canAddOutput:videoOutput]) {
-      [self.session addOutput:videoOutput];
-    } else {
-      [videoOutput release];
-      return nil;
+    SCDisplay *display = [self resolveDisplay];
+    if (display == nil) {
+      dispatch_semaphore_signal(self.captureStopSignal);
+      return self.captureStopSignal;
     }
 
-    AVCaptureConnection *videoConnection = [videoOutput connectionWithMediaType:AVMediaTypeVideo];
-    dispatch_semaphore_t signal = dispatch_semaphore_create(0);
+    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display
+                                                     excludingWindows:@[]];
 
-    [self.videoOutputs setObject:videoOutput forKey:videoConnection];
-    [self.captureCallbacks setObject:frameCallback forKey:videoConnection];
-    [self.captureSignals setObject:signal forKey:videoConnection];
+    SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
+    config.width = self.frameWidth;
+    config.height = self.frameHeight;
+    // The whole point of this backend: cap the frame interval at 1/fps instead
+    // of letting SCK fall back to its 1/60 default. Content-driven delivery
+    // means a game rendering at 120 yields ~120 captured frames.
+    config.minimumFrameInterval = self.minFrameDuration;
+    config.pixelFormat = self.pixelFormat;
+    config.queueDepth = 8;
+    config.showsCursor = YES;  // AVCaptureScreenInput embedded the cursor; match it.
 
-    [self.session startRunning];
+    self.sampleQueue = dispatch_queue_create(
+      "videoCaptureQueue",
+      dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
 
-    return signal;
+    self.stream = [[SCStream alloc] initWithFilter:filter
+                                     configuration:config
+                                          delegate:self];
+
+    NSError *addError = nil;
+    if (![self.stream addStreamOutput:self
+                                 type:SCStreamOutputTypeScreen
+                   sampleHandlerQueue:self.sampleQueue
+                                error:&addError]) {
+      self.stream = nil;
+      dispatch_semaphore_signal(self.captureStopSignal);
+      return self.captureStopSignal;
+    }
+
+    [self.stream startCaptureWithCompletionHandler:^(NSError *error) {
+      if (error) {
+        [self stopStream];
+      }
+    }];
+
+    return self.captureStopSignal;
   }
 }
 
-- (void)captureOutput:(AVCaptureOutput *)captureOutput
-  didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
-         fromConnection:(AVCaptureConnection *)connection {
-  FrameCallbackBlock callback = [self.captureCallbacks objectForKey:connection];
+/**
+ * @brief Tear down the stream once and signal the stop semaphore exactly once.
+ */
+- (void)stopStream {
+  SCStream *toStop = nil;
+  @synchronized(self) {
+    if (self.stopped) {
+      return;
+    }
+    self.stopped = YES;
+    toStop = self.stream;
+    self.stream = nil;
+  }
 
-  if (callback != nil) {
-    if (!callback(sampleBuffer)) {
-      @synchronized(self) {
-        [self.session stopRunning];
-        [self.captureCallbacks removeObjectForKey:connection];
-        [self.session removeOutput:[self.videoOutputs objectForKey:connection]];
-        [self.videoOutputs removeObjectForKey:connection];
-        dispatch_semaphore_signal([self.captureSignals objectForKey:connection]);
-        [self.captureSignals removeObjectForKey:connection];
-        [self.session startRunning];
-      }
+  if (toStop) {
+    [toStop stopCaptureWithCompletionHandler:^(NSError *error) {
+      (void) error;
+    }];
+  }
+
+  if (self.captureStopSignal) {
+    dispatch_semaphore_signal(self.captureStopSignal);
+  }
+}
+
+#pragma mark - SCStreamOutput
+
+- (void)stream:(SCStream *)stream
+  didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+                 ofType:(SCStreamOutputType)type {
+  if (type != SCStreamOutputTypeScreen) {
+    return;
+  }
+  if (!CMSampleBufferIsValid(sampleBuffer) || CMSampleBufferGetImageBuffer(sampleBuffer) == NULL) {
+    return;
+  }
+
+  // SCK sends status frames (idle/blank/started/suspended) with no useful
+  // pixels. Only forward frames flagged complete.
+  NSArray *attachments = (__bridge NSArray *) CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, NO);
+  if (attachments.count > 0) {
+    NSDictionary *info = attachments[0];
+    NSNumber *status = info[SCStreamFrameInfoStatus];
+    if (status != nil && status.intValue != SCFrameStatusComplete) {
+      return;
     }
   }
+
+  FrameCallbackBlock callback = nil;
+  @synchronized(self) {
+    if (self.stopped) {
+      return;
+    }
+    callback = self.frameCallback;
+  }
+  if (callback == nil) {
+    return;
+  }
+
+  // Returning false from the callback means the pipeline wants to stop.
+  if (!callback(sampleBuffer)) {
+    [self stopStream];
+  }
+}
+
+#pragma mark - SCStreamDelegate
+
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+  [self stopStream];
+}
+
+- (void)dealloc {
+  [self stopStream];
 }
 
 @end
