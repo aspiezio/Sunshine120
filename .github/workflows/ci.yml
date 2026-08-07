@@ -96,7 +96,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/ci-macos.yml
     with:
-      publish_release: ${{ needs.release-setup.outputs.publish_release }}
+      publish_release: false
       release_commit: ${{ needs.release-setup.outputs.release_commit }}
       release_version: ${{ needs.release-setup.outputs.release_version }}
     secrets:
