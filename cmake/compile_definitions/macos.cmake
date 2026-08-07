@@ -36,7 +36,12 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         ${CORE_VIDEO_LIBRARY}
         ${FOUNDATION_LIBRARY}
         ${IOKIT_LIBRARY}
-        ${VIDEO_TOOLBOX_LIBRARY})
+        ${VIDEO_TOOLBOX_LIBRARY}
+        ${SCREEN_CAPTURE_KIT_LIBRARY})
+
+set_source_files_properties(
+      "${CMAKE_SOURCE_DIR}/src/platform/macos/av_video.m"
+      PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 set(APPLE_PLIST_TEMPLATE "${SUNSHINE_SOURCE_ASSETS_DIR}/macos/build/Info.plist.in")
 set(APPLE_PLIST_FILE "${CMAKE_BINARY_DIR}/Info.plist")
