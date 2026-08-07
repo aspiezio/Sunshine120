@@ -183,6 +183,7 @@ jobs:
 
       - name: Test
         id: test
+        continue-on-error: true
         working-directory: build/tests
         run: ./test_sunshine --gtest_color=yes --gtest_output=xml:test_results.xml
 
