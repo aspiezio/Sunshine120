@@ -15,6 +15,8 @@
 @property (nonatomic, strong) dispatch_semaphore_t captureStopSignal;  ///< Signaled on stop.
 @property (nonatomic, strong) dispatch_queue_t sampleQueue;  ///< Serial delivery queue.
 @property (nonatomic, assign) BOOL stopped;  ///< Guards single-shot teardown.
+@property (nonatomic, assign) long frameCount;  ///< Frames delivered this cycle (diag).
+@property (nonatomic, assign) long cycle;  ///< capture: invocation counter (diag).
 @end
 /// @endcond
 
@@ -78,6 +80,8 @@
   }];
 
   dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+  NSLog(@"AVVIDEO_DIAG: resolveDisplay -> %@ (displayID=%u)",
+        found ? @"FOUND" : @"NIL", (unsigned) found.displayID);
   return found;
 }
 
@@ -85,10 +89,18 @@
   @synchronized(self) {
     self.frameCallback = frameCallback;
     self.stopped = NO;
+    self.frameCount = 0;
+    self.cycle += 1;
     self.captureStopSignal = dispatch_semaphore_create(0);
+    NSLog(@"AVVIDEO_DIAG: capture: ENTER cycle=%ld displayID=%u %dx%d minFrameInterval=%d/%d pixFmt=%c%c%c%c",
+          (long) self.cycle, (unsigned) self.displayID, self.frameWidth, self.frameHeight,
+          (int) self.minFrameDuration.value, (int) self.minFrameDuration.timescale,
+          (char) ((self.pixelFormat >> 24) & 0xFF), (char) ((self.pixelFormat >> 16) & 0xFF),
+          (char) ((self.pixelFormat >> 8) & 0xFF), (char) (self.pixelFormat & 0xFF));
 
     SCDisplay *display = [self resolveDisplay];
     if (display == nil) {
+      NSLog(@"AVVIDEO_DIAG: capture: NO DISPLAY -> aborting cycle=%ld", (long) self.cycle);
       dispatch_semaphore_signal(self.captureStopSignal);
       return self.captureStopSignal;
     }
@@ -120,12 +132,15 @@
                                  type:SCStreamOutputTypeScreen
                    sampleHandlerQueue:self.sampleQueue
                                 error:&addError]) {
+      NSLog(@"AVVIDEO_DIAG: addStreamOutput FAILED: %@", addError);
       self.stream = nil;
       dispatch_semaphore_signal(self.captureStopSignal);
       return self.captureStopSignal;
     }
+    NSLog(@"AVVIDEO_DIAG: addStreamOutput OK cycle=%ld", (long) self.cycle);
 
     [self.stream startCaptureWithCompletionHandler:^(NSError *error) {
+      NSLog(@"AVVIDEO_DIAG: startCapture completion cycle=%ld error=%@", (long) self.cycle, error ?: @"nil");
       if (error) {
         [self stopStream];
       }
@@ -188,8 +203,15 @@
     return;
   }
 
+  self.frameCount += 1;
+  if (self.frameCount == 1 || (self.frameCount % 60) == 0) {
+    NSLog(@"AVVIDEO_DIAG: delivered frame #%ld (cycle=%ld)", (long) self.frameCount, (long) self.cycle);
+  }
+
   // Returning false from the callback means the pipeline wants to stop.
   if (!callback(sampleBuffer)) {
+    NSLog(@"AVVIDEO_DIAG: callback returned FALSE at frame #%ld (cycle=%ld) -> stopping",
+          (long) self.frameCount, (long) self.cycle);
     [self stopStream];
   }
 }
@@ -197,6 +219,7 @@
 #pragma mark - SCStreamDelegate
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+  NSLog(@"AVVIDEO_DIAG: didStopWithError cycle=%ld error=%@", (long) self.cycle, error ?: @"nil");
   [self stopStream];
 }
 
